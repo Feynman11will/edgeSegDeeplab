@@ -197,7 +197,7 @@ def main():
                         help='whether to use sync bn (default: auto)')
     parser.add_argument('--freeze-bn', type=bool, default=False,
                         help='whether to freeze bn parameters (default: False)')
-    parser.add_argument('--loss-type', type=str, default='ce',
+    parser.add_argument('--loss-type', type=str, default='edgece',
                         choices=['ce', 'focal'],
                         help='loss func type (default: ce)')
     # training hyper params

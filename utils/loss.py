@@ -4,18 +4,18 @@ import logging
 import numpy as np
 from skimage import io,data,morphology
 import cv2
-logging.basicConfig('../logPath/edgeloss.log',level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 
 
 class SegmentationLosses(object):
-    def __init__(self, weight=None, size_average=True, batch_average=True, ignore_index=255, cuda=False,index_list=None):
+    def __init__(self, weight=None, size_average=True, batch_average=True, ignore_index=255, cuda=False,index_list=None,nc=3):
         self.ignore_index = ignore_index
         self.weight = weight
         self.size_average = size_average
         self.batch_average = batch_average
         self.cuda = cuda
         self.index_list = index_list
-
+        self.nc = nc
     def build_loss(self, mode='ce'):
         """Choices: ['ce' or 'focal']"""
         if mode == 'ce':
@@ -64,15 +64,22 @@ class SegmentationLosses(object):
         @ edgeCeloss = edgeLoss+ crossEntropy loss
         """
         n, c, h, w = logit.size()
+        # c=3*nc
         Edge, Weight = self.splitMask2Edge(target)
-
-        lossSeg = self.CrossEntropyLoss(logit, target)
-        lossEdge = 0
+        nc = self.nc
+        predSeg = logit[:,0:nc,:,:]
+        predEdge = logit[:,nc:,:,:]
+        logging.info(f"predEdge size:{predEdge.size()}")
+        logging.info(f"predSeg size:{predSeg.size()}")
+        lossSeg = self.CrossEntropyLoss(predSeg, target)
+        lossEdge = self.edgeLoss(predSeg, predEdge, target, Edge, Weight)
         loss = lossSeg + lossEdge
-
+        if self.batch_average:
+            loss /= n
+        logging.info(f"batch_average :{self.batch_average}")
         return loss
         
-    def splitMask2Edge(self, target,nc=20):
+    def splitMask2Edge(self, target):
         '''
         @ 将一个mask 按照分类数量分裂成c个mask边界框
         '''
@@ -81,14 +88,15 @@ class SegmentationLosses(object):
         logging.info(f'target type:{type(target)}')
         
         if self.index_list==None:
-            self.index_list = [i+1 for i in range(nc)]
+            self.index_list = [i+1 for i in range(self.nc)]# 取出背景分类 nc-1 
 
         target_list = torch.chunk(target,n, dim=0)
+
         logging.info(f'target_list len:{len(target_list)}')
         maskEdgeList  = []
         weightEdgeList = []
 
-
+        logging.info(f"target date type:{target.dtype}")
         for target_ in target_list:
             maskList = []
             weightList = []
@@ -99,6 +107,7 @@ class SegmentationLosses(object):
                     weight,edge =  weight.cuda(), edge.cuda()
                 maskList.append(edge)
                 weightList.append(weight)
+
             maskEdge = torch.unsqueeze(torch.cat(maskList,axis=0),dim=0)
             weightEdge = torch.unsqueeze(torch.cat(weightList,axis=0),dim=0)
             maskEdgeList.append(maskEdge)
@@ -134,19 +143,48 @@ class SegmentationLosses(object):
         k = morphology.square(width = 3)      #正方形
         imageOut = morphology.erosion(imageMask, k)
         outlier = imageMask - imageOut
-        edge = torch.from_numpy(outlier[None,:,:])
         blur = cv2.GaussianBlur(outlier*255,(blurSize,blurSize),0)/255.
-        weight = torch.from_numpy(blur[None,:,:])
+        outlier = np.asarray(outlier!=0,np.double)
+        edge = torch.from_numpy(outlier[None,:,:]).float()
+        weight = torch.from_numpy(blur[None,:,:]).float()
         return edge, weight
+
+    def edgeLoss(self,predSeg, predEdge,target, Edge, Weight):
+        """
+        predEdge: [n, nc, h, w]
+        edge: [n,nc,h,w]
+        wight :[n,nc,h,w]
+        math Function:
+            
+        """
+        softmax = nn.Softmax(dim=1)
+        softOut = softmax(predSeg)
+        maxIndex = torch.argmax(softOut,dim=1)
+        nc = self.nc
+        lossEdge = 0
+        for n in range(nc):
+            # 分割的mask 
+            pscMask = maxIndex == n
+            gscMask = target==n 
+            # 正确分类mask
+            segCMaskIndex = pscMask & pscMask
+            # 边界分类mask 
+            PEdgeN = predEdge[:,n,:,:][segCMaskIndex]
+            GEdgeN = Edge[:,n,:,:][segCMaskIndex]
+            W = 1- Weight[:,n,:,:][segCMaskIndex]
+            lossn = nn.functional.binary_cross_entropy_with_logits(PEdgeN, GEdgeN*W)
+            lossEdge+=lossn
+        return lossEdge
 
 if __name__ == "__main__":
     loss = SegmentationLosses(cuda=True)
-    a = torch.rand(1, 3, 7, 7).cuda()
+    a = torch.rand(1, 6, 7, 7).cuda()
     b = torch.rand(1, 7, 7).cuda()
-    print(loss.CrossEntropyLoss(a, b).item())
-    print(loss.FocalLoss(a, b, gamma=0, alpha=None).item())
-    print(loss.FocalLoss(a, b, gamma=2, alpha=0.5).item())
+    # print(loss.CrossEntropyLoss(a, b).item())
+    logit = a
 
+    target = b
+    print(loss.EdgeCeloss(logit, target,alpha=0.2, beta=0.6).item())
 
 
 

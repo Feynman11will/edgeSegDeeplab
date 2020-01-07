@@ -4,7 +4,7 @@ import logging
 import numpy as np
 from skimage import io,data,morphology
 import cv2
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.WARN)
 
 
 class SegmentationLosses(object):
@@ -34,7 +34,7 @@ class SegmentationLosses(object):
         if self.cuda:
             criterion = criterion.cuda()
         
-        loss = criterion(logit, target.long())
+        loss = criterion(logit[0:self.nc], target.long())
 
         if self.batch_average:
             loss /= n
@@ -65,14 +65,15 @@ class SegmentationLosses(object):
         """
         n, c, h, w = logit.size()
         # c=3*nc
-        Edge, Weight = self.splitMask2Edge(target)
+        # unbalence shape = [n,nc]
+        Edge, Weight, unbalence = self.splitMask2Edge(target)
         nc = self.nc
         predSeg = logit[:,0:nc,:,:]
         predEdge = logit[:,nc:,:,:]
         logging.info(f"predEdge size:{predEdge.size()}")
         logging.info(f"predSeg size:{predSeg.size()}")
         lossSeg = self.CrossEntropyLoss(predSeg, target)
-        lossEdge = self.edgeLoss(predSeg, predEdge, target, Edge, Weight)
+        lossEdge = self.edgeLoss(predSeg, predEdge, target, Edge, Weight,unbalence)
         loss = lossSeg + lossEdge
         if self.batch_average:
             loss /= n
@@ -88,36 +89,45 @@ class SegmentationLosses(object):
         logging.info(f'target type:{type(target)}')
         
         if self.index_list==None:
-            self.index_list = [i+1 for i in range(self.nc)]# 取出背景分类 nc-1 
-
+            self.index_list = [i for i in range(self.nc)]
         target_list = torch.chunk(target,n, dim=0)
 
         logging.info(f'target_list len:{len(target_list)}')
         maskEdgeList  = []
         weightEdgeList = []
-
+        unbalenceList = []
         logging.info(f"target date type:{target.dtype}")
+        logging.info(f"index_list:{self.index_list}")
         for target_ in target_list:
             maskList = []
             weightList = []
+            unbalenceScalarList = np.zeros([1,self.nc],dtype=np.float)
+            
             for index in self.index_list:
-                IndexTensor = (target_==index).float()
-                edge,weight = self.getEdgeWeight(IndexTensor,blurSize= 7)
+                IndexTensor = (target_==index)
+                if index==0:
+                    IndexTensor = torch.logical_not(IndexTensor)
+                IndexTensor = IndexTensor.float()
+                edge,weight , unbalenceScalar = self.getEdgeWeight(IndexTensor,blurSize= 7)
                 if self.cuda:
                     weight,edge =  weight.cuda(), edge.cuda()
                 maskList.append(edge)
                 weightList.append(weight)
+                unbalenceScalarList[:,index] = unbalenceScalar
 
             maskEdge = torch.unsqueeze(torch.cat(maskList,axis=0),dim=0)
             weightEdge = torch.unsqueeze(torch.cat(weightList,axis=0),dim=0)
             maskEdgeList.append(maskEdge)
             weightEdgeList.append(weightEdge)
+            unbalenceList.append(unbalenceScalarList)
 
-        Edge = torch.cat(maskEdgeList,axis=0)
-        Weight = torch.cat(weightEdgeList,axis=0)
+        Edge = torch.cat(maskEdgeList,axis = 0)
+        Weight = torch.cat(weightEdgeList,axis = 0)
+        unbalence = np.concatenate(unbalenceList,axis = 0)
         logging.info(f"Weight size:{Weight.size()}")
         logging.info(f"Edge size:{Edge.size()}")
-        return Edge, Weight
+
+        return Edge, Weight,unbalence
 
     def getEdgeWeight(self,IndexTensor,blurSize = 7):
         
@@ -138,30 +148,37 @@ class SegmentationLosses(object):
         if np.all(imageMask==0):
             weight = torch.zeros(size)
             edge = torch.zeros(size)
-            return edge, weight
+            unbalenceScalar = torch.zeros(1)[0]
+            return edge, weight,unbalenceScalar
 
         k = morphology.square(width = 3)      #正方形
         imageOut = morphology.erosion(imageMask, k)
         outlier = imageMask - imageOut
         blur = cv2.GaussianBlur(outlier*255,(blurSize,blurSize),0)/255.
-        outlier = np.asarray(outlier!=0,np.double)
+        outlier = np.asarray(outlier!=0,np.float)
+        logging.info(f"outlier:{outlier.shape}")
+        unbalenceScalar = np.sum(np.asarray(outlier == 0,np.int))/(outlier.shape[0]*outlier.shape[1])
+        logging.info(f"观测unbalenceScalar:{unbalenceScalar}")
+        unbalenceScalar = torch.from_numpy(unbalenceScalar[None])[0]
         edge = torch.from_numpy(outlier[None,:,:]).float()
-        weight = torch.from_numpy(blur[None,:,:]).float()
-        return edge, weight
 
-    def edgeLoss(self,predSeg, predEdge,target, Edge, Weight):
+        weight = torch.from_numpy(blur[None,:,:]).float()
+
+        return edge, weight, unbalenceScalar
+
+    def edgeLoss2(self,predSeg, predEdge,target, Edge, Weight,unbalence):
         """
         predEdge: [n, nc, h, w]
         edge: [n,nc,h,w]
         wight :[n,nc,h,w]
         math Function:
-            
         """
         softmax = nn.Softmax(dim=1)
         softOut = softmax(predSeg)
         maxIndex = torch.argmax(softOut,dim=1)
         nc = self.nc
         lossEdge = 0
+        logging.info(f"unbalence:{unbalence}")
         for n in range(nc):
             # 分割的mask 
             pscMask = maxIndex == n
@@ -171,11 +188,26 @@ class SegmentationLosses(object):
             # 边界分类mask 
             PEdgeN = predEdge[:,n,:,:][segCMaskIndex]
             GEdgeN = Edge[:,n,:,:][segCMaskIndex]
-            W = 1- Weight[:,n,:,:][segCMaskIndex]
-            lossn = nn.functional.binary_cross_entropy_with_logits(PEdgeN, GEdgeN*W)
+            W = 1 - Weight[:,n,:,:][segCMaskIndex]
+            unb = unbalence[:,n].mean()
+            ce = torch.nn.functional.binary_cross_entropy_with_logits(W*GEdgeN,PEdgeN )
+            lossn = unb*ce
             lossEdge+=lossn
         return lossEdge
+    def edgeLoss(self,predSeg, predEdge,target, Edge, Weight,unbalence):
+        lossEdge = 0
+        for n in range(self.nc):
 
+            PEdgeN = predEdge[:,n,:,:]
+            GEdgeN = Edge[:,n,:,:]
+            W = 1 - Weight[:,n,:,:]
+            unb = unbalence[:,n].mean()
+            ce = torch.nn.functional.binary_cross_entropy_with_logits(W*GEdgeN,PEdgeN )
+            lossn = unb*ce
+            lossEdge+=lossn
+        return lossEdge
+        
+        
 if __name__ == "__main__":
     loss = SegmentationLosses(cuda=True)
     a = torch.rand(1, 6, 7, 7).cuda()
